@@ -67,6 +67,11 @@ void os_set_agent_crypto_method(keystore * keys,const int method){
     keys->keyentries[0]->crypto_method = method;
 }
 
+/* Set the agent message version */
+void w_set_agent_msg_version(keystore * keys,const int version){
+    keys->keyentries[0]->msg_version = version;
+}
+
 static time_t saved_time = 0;
 
 /* Read counters for each agent */
@@ -274,11 +279,15 @@ char *ReadSecMSG(keystore *keys, char *buffer, char *cleartext, int id, unsigned
 {
     unsigned int msg_global = 0;
     unsigned int msg_local = 0;
+    unsigned int msg_uncompressed_size = 0;
+    unsigned int guess_size = 1;
+    unsigned int f_buffer_size = 0;
     char *f_msg;
-
+    char *u_buffer = NULL;
 
     if(strncmp(buffer, "#AES", 4)==0){
         buffer+=4;
+        f_buffer_size+=4;
         #ifndef CLIENT
             keys->keyentries[id]->crypto_method = W_METH_AES;
         #endif
@@ -289,6 +298,20 @@ char *ReadSecMSG(keystore *keys, char *buffer, char *cleartext, int id, unsigned
         #endif
     }
 
+    // Check if we have uncompressed msg size before hand
+    keys->keyentries[id]->msg_version = W_VERSION_0;
+    char* usize_end;
+    if(strncmp(buffer,"#USIZE:",7) == 0)
+    {
+        buffer+=7;
+        f_buffer_size+=7;
+        msg_uncompressed_size = strtoll(buffer,&usize_end,10);
+        os_calloc(msg_uncompressed_size,sizeof(char *),u_buffer);
+        guess_size = 0;
+        keys->keyentries[id]->msg_version = W_VERSION_1;
+        f_buffer_size += usize_end-buffer;
+        buffer=usize_end;
+    }
 
     if (*buffer == ':') {
         buffer++;
@@ -301,14 +324,14 @@ char *ReadSecMSG(keystore *keys, char *buffer, char *cleartext, int id, unsigned
     switch(keys->keyentries[id]->crypto_method){
         case W_METH_BLOWFISH:
             if (!OS_BF_Str(buffer, cleartext, keys->keyentries[id]->key,
-                        buffer_size, OS_DECRYPT)) {
+                        buffer_size-f_buffer_size, OS_DECRYPT)) {
                 merror(ENCKEY_ERROR, keys->keyentries[id]->ip->ip);
                 return (NULL);
             }
             break;
         case W_METH_AES:
             if (!OS_AES_Str(buffer, cleartext, keys->keyentries[id]->key,
-                buffer_size-4, OS_DECRYPT)) {
+                buffer_size-f_buffer_size, OS_DECRYPT)) {
                 merror(ENCKEY_ERROR, keys->keyentries[id]->ip->ip);
                 return (NULL);
             }
@@ -328,13 +351,28 @@ char *ReadSecMSG(keystore *keys, char *buffer, char *cleartext, int id, unsigned
         }
 
         /* Uncompress */
-        if (*final_size = os_zlib_uncompress(cleartext, buffer, buffer_size, OS_MAXSTR), !*final_size) {
-            merror(UNCOMPRESS_ERR);
-            return (NULL);
+        if(guess_size){ 
+            msg_uncompressed_size = OS_MAXSTR;
+            os_realloc(u_buffer,sizeof(char) * msg_uncompressed_size,u_buffer);
+
+            if (*final_size = os_zlib_uncompress(cleartext, u_buffer, buffer_size, msg_uncompressed_size), !*final_size) {
+                free(u_buffer);
+                u_buffer= NULL;
+                merror(UNCOMPRESS_ERR);
+                return (NULL);
+            }
         }
+        else
+        {
+            if (*final_size = os_zlib_uncompress(cleartext, u_buffer, buffer_size, msg_uncompressed_size), !*final_size) {
+                merror(UNCOMPRESS_ERR);
+                return (NULL);
+            }
+        }
+        
+        buffer = u_buffer;
 
         /* Check checksum */
-
         if (f_msg = CheckSum(buffer, *final_size), !f_msg) {
             merror(ENCSUM_ERROR, keys->keyentries[id]->ip->ip);
             return (NULL);
@@ -499,6 +537,8 @@ size_t CreateSecMSG(const keystore *keys, const char *msg, size_t msg_length, ch
     char _tmpmsg[OS_MAXSTR + 2];
     char _finmsg[OS_MAXSTR + 2];
     char crypto_token[6] = {0};
+    char *u_size_token = "#USIZE";
+    unsigned long u_size_length = 0;
     unsigned long crypto_length = 0;
     int crypto_method = 0;
     os_md5 md5sum;
@@ -520,10 +560,10 @@ size_t CreateSecMSG(const keystore *keys, const char *msg, size_t msg_length, ch
     switch(crypto_method)
     {
         case W_METH_BLOWFISH:
-            memcpy(crypto_token,":",1);
+            memcpy(crypto_token,"",1);
             break;
         case W_METH_AES:
-            memcpy(crypto_token,"#AES:",5);
+            memcpy(crypto_token,"#AES",4);
             break;
         default:
             return OS_INVALID;
@@ -556,6 +596,7 @@ size_t CreateSecMSG(const keystore *keys, const char *msg, size_t msg_length, ch
     strcpy(_finmsg, md5sum);
     memcpy(_finmsg + 32, _tmpmsg, length);
     length += 32;
+    u_size_length = length;
 
     /* Compress the message
      * We assign the first 8 bytes for padding
@@ -606,6 +647,15 @@ size_t CreateSecMSG(const keystore *keys, const char *msg, size_t msg_length, ch
         /* Set beginning of the message */
         length = snprintf(msg_encrypted, 6, "%s",crypto_token);
     }
+
+    /* If the message is version 1, add the uncompressed buffer size */
+    if(keys->keyentries[id]->msg_version == W_VERSION_1)
+    {
+      length += snprintf(msg_encrypted + length , 36, "%s:%lu",u_size_token,u_size_length);  
+    }
+
+    /* The message must have ':' before the encrypted data */
+    length += snprintf(msg_encrypted + length , 2, ":");  
 
     /* length is the amount of non-encrypted message appended to the buffer
      * On dynamic IPs, it will include the agent ID
