@@ -1,4 +1,5 @@
-/* Copyright (C) 2009 Trend Micro Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
  * All right reserved.
  *
  * This program is a free software; you can redistribute it
@@ -7,25 +8,44 @@
  * Foundation
  */
 
-#if defined(__linux__)
-#include <sys/epoll.h>
-#elif defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-#include <sys/types.h>
-#include <sys/event.h>
-#endif /* __linux__ */
-
 #include "shared.h"
 #include "os_net/os_net.h"
 #include "remoted.h"
 
+/* Global variables */
+int sender_pool;
+
+static netbuffer_t netbuffer;
+
 // Message handler thread
 static void * rem_handler_main(__attribute__((unused)) void * args);
+
+// Key reloader thread
+void * rem_keyupdate_main(__attribute__((unused)) void * args);
 
 /* Handle each message received */
 static void HandleSecureMessage(char *buffer, int recv_b, struct sockaddr_in *peer_info, int sock_client);
 
 // Close and remove socket from keystore
 int _close_sock(keystore * keys, int sock);
+
+/* Status of keypolling wodle */
+static char key_request_available = 0;
+
+/* Decode hostinfo input queue */
+static w_queue_t * key_request_queue;
+
+/* Remote key request thread */
+void * w_key_request_thread(__attribute__((unused)) void * args);
+
+/* Push key request */
+static void _push_request(const char *request,const char *type);
+#define push_request(x, y) if (key_request_available) _push_request(x, y);
+
+/* Connect to key polling wodle*/
+#define KEY_RECONNECT_INTERVAL 300 // 5 minutes
+static int key_request_connect();
+static int key_request_reconnect();
 
 /* Handle secure connections */
 void HandleSecure()
@@ -35,21 +55,8 @@ void HandleSecure()
     int n_events = 0;
     char buffer[OS_MAXSTR + 1];
     ssize_t recv_b;
-    uint32_t length;
     struct sockaddr_in peer_info;
-
-#if defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-    const struct timespec TS_ZERO = { 0, 0 };
-    struct timespec ts_timeout = { EPOLL_MILLIS / 1000, (EPOLL_MILLIS % 1000) * 1000000 };
-    struct timespec *p_timeout = EPOLL_MILLIS < 0 ? NULL : &ts_timeout;
-    int kqueue_fd = 0;
-    struct kevent request;
-    struct kevent *events = NULL;
-#elif defined(__linux__)
-    int epoll_fd = 0;
-    struct epoll_event request = { .events = 0 };
-    struct epoll_event *events = NULL;
-#endif /* __MACH__ || __FreeBSD__ || __OpenBSD__ */
+    wnotify_t * notify = NULL;
 
     /* Initialize manager */
     manager_init();
@@ -57,20 +64,34 @@ void HandleSecure()
     // Initialize messag equeue
     rem_msginit(logr.queue_size);
 
-    /* Create Active Response forwarder thread */
+    /* Initialize the agent key table mutex */
+    key_lock_init();
+
+    /* Create shared file updating thread */
     w_create_thread(update_shared_files, NULL);
 
     /* Create Active Response forwarder thread */
     w_create_thread(AR_Forward, NULL);
 
+    /* Create Security configuration assessment forwarder thread */
+    w_create_thread(SCFGA_Forward, NULL);
+
     // Create Request listener thread
     w_create_thread(req_main, NULL);
+
+    // Create State writer thread
+    w_create_thread(rem_state_main, NULL);
+
+    key_request_queue = queue_init(1024);
+
+    // Create key request thread
+    w_create_thread(w_key_request_thread, NULL);
 
     /* Create wait_for_msgs threads */
 
     {
         int i;
-        int sender_pool = getDefine_Int("remoted", "sender_pool", 1, 64);
+        sender_pool = getDefine_Int("remoted", "sender_pool", 1, 64);
 
         mdebug2("Creating %d sender threads.", sender_pool);
 
@@ -79,8 +100,15 @@ void HandleSecure()
         }
     }
 
-    // Create message handler thread
-    w_create_thread(rem_handler_main, NULL);
+    // Create message handler thread pool
+    {
+        int worker_pool = getDefine_Int("remoted", "worker_pool", 1, 16);
+
+        while (worker_pool > 0) {
+            w_create_thread(rem_handler_main, NULL);
+            worker_pool--;
+        }
+    }
 
     /* Connect to the message queue
      * Exit if it fails.
@@ -96,6 +124,9 @@ void HandleSecure()
     OS_ReadKeys(&keys, 1, 0, 0);
     OS_StartCounter(&keys);
 
+    // Key reloader thread
+    w_create_thread(rem_keyupdate_main, NULL);
+
     /* Set up peer size */
     logr.peer_size = sizeof(peer_info);
 
@@ -103,46 +134,19 @@ void HandleSecure()
     memset(buffer, '\0', OS_MAXSTR + 1);
 
     if (protocol == TCP_PROTO) {
-#if defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-        os_calloc(MAX_EVENTS, sizeof(struct kevent), events);
-        kqueue_fd = kqueue();
-
-        if (kqueue_fd < 0) {
-            merror_exit(KQUEUE_ERROR);
+        if (notify = wnotify_init(MAX_EVENTS), !notify) {
+            merror_exit("wnotify_init(): %s (%d)", strerror(errno), errno);
         }
 
-        EV_SET(&request, logr.sock, EVFILT_READ, EV_ADD, 0, 0, 0);
-
-        if (kevent(kqueue_fd, &request, 1, NULL, 0, &TS_ZERO) < 0) {
-            merror_exit("kevent when adding listening socket: %s (%d)", strerror(errno), errno);
+        if (wnotify_add(notify, logr.sock) < 0) {
+            merror_exit("wnotify_add(%d): %s (%d)", logr.sock, strerror(errno), errno);
         }
-#elif defined(__linux__)
-        os_calloc(MAX_EVENTS, sizeof(struct epoll_event), events);
-        epoll_fd = epoll_create(MAX_EVENTS);
-
-        if (epoll_fd < 0) {
-            merror_exit(EPOLL_ERROR);
-        }
-
-        request.events = EPOLLIN;
-        request.data.fd = logr.sock;
-
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, logr.sock, &request) < 0) {
-            merror_exit("epoll when adding listening socket: %s (%d)", strerror(errno), errno);
-        }
-#endif /* __MACH__ || __FreeBSD__ || __OpenBSD__ */
     }
 
     while (1) {
         /* Receive message  */
         if (protocol == TCP_PROTO) {
-#if defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-            n_events = kevent(kqueue_fd, NULL, 0, events, MAX_EVENTS, p_timeout);
-#elif defined(__linux__)
-            n_events = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_MILLIS);
-#endif /* __MACH__ || __FreeBSD__ || __OpenBSD__ */
-
-            if (n_events < 0) {
+            if (n_events = wnotify_wait(notify, EPOLL_MILLIS), n_events < 0) {
                 if (errno != EINTR) {
                     merror("Waiting for connection: %s (%d)", strerror(errno), errno);
                     sleep(1);
@@ -153,99 +157,53 @@ void HandleSecure()
 
             int i;
             for (i = 0; i < n_events; i++) {
-#if defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-                int fd = events[i].ident;
-#elif defined(__linux__)
-                int fd = events[i].data.fd;
-#else
-                int fd = 0;
-#endif /* __MACH__ || __FreeBSD__ || __FreeBSD__ */
+                int fd = wnotify_get(notify, i);
+
                 if (fd == logr.sock) {
                     sock_client = accept(logr.sock, (struct sockaddr *)&peer_info, &logr.peer_size);
                     if (sock_client < 0) {
                         merror_exit(ACCEPT_ERROR);
                     }
 
-                    mdebug1("New TCP connection at %s.", inet_ntoa(peer_info.sin_addr));
-#if defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-                    EV_SET(&request, sock_client, EVFILT_READ, EV_ADD, 0, 0, 0);
+                    nb_open(&netbuffer, sock_client, &peer_info);
+                    rem_inc_tcp();
+                    mdebug1("New TCP connection at %s [%d]", inet_ntoa(peer_info.sin_addr), sock_client);
 
-                    if (kevent(kqueue_fd, &request, 1, NULL, 0, &TS_ZERO) < 0) {
-                        merror("kevent when adding connected socket: %s (%d)", strerror(errno), errno);
+                    if (wnotify_add(notify, sock_client) < 0) {
+                        merror("wnotify_add(%d, %d): %s (%d)", notify->fd, sock_client, strerror(errno), errno);
                         _close_sock(&keys, sock_client);
                     }
-#elif defined(__linux__)
-                    request.data.fd = sock_client;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock_client, &request) < 0) {
-                        merror("epoll when adding connected socket: %s (%d)", strerror(errno), errno);
-                        _close_sock(&keys, sock_client);
-                    }
-#endif /* __MACH__ || __FreeBSD__ || __OpenBSD__ */
                 } else {
                     sock_client = fd;
-                    recv_b = recv(sock_client, (char*)&length, sizeof(length), MSG_WAITALL);
-                    length = wnet_order(length);
 
-                    if (getpeername(sock_client, (struct sockaddr *)&peer_info, &logr.peer_size) < 0) {
+                    switch (recv_b = nb_recv(&netbuffer, sock_client), recv_b) {
+                    case -2:
+                        mwarn("Too big message size from %s [%d].", inet_ntoa(peer_info.sin_addr), sock_client);
+                        _close_sock(&keys, sock_client);
+                        continue;
+
+                    case -1:
                         switch (errno) {
-                            case ENOTCONN:
-                                mdebug1("TCP peer was disconnected.");
-                                break;
-                            default:
-                                merror("Couldn't get the remote peer information: %s [%d]", strerror(errno), errno);
-                        }
-
-                        _close_sock(&keys, sock_client);
-                        continue;
-                    }
-
-                    mdebug2("recv(): length=%d [%zu]", length, recv_b);
-
-                    /* Nothing received */
-                    if (recv_b <= 0 || length > OS_MAXSTR) {
-                        switch (recv_b) {
-                        case -1:
-                            if (errno == ENOTCONN) {
-                                mdebug1("TCP peer at %s disconnected (ENOTCONN).", inet_ntoa(peer_info.sin_addr));
-                            } else {
-                                merror("TCP peer at %s: %s (%d)", inet_ntoa(peer_info.sin_addr), strerror(errno), errno);
-                            }
-
+                        case ECONNRESET:
+                        case ENOTCONN:
+                            mdebug2("TCP peer [%d] at %s: %s (%d)", sock_client, inet_ntoa(peer_info.sin_addr), strerror(errno), errno);
                             break;
-
-                        case 0:
-                            mdebug1("TCP peer at %s disconnected.", inet_ntoa(peer_info.sin_addr));
-                            break;
-
                         default:
-                            // length > OS_MAXSTR
-                            merror("Too big message size from %s.", inet_ntoa(peer_info.sin_addr));
+                            merror("TCP peer [%d] at %s: %s (%d)", sock_client, inet_ntoa(peer_info.sin_addr), strerror(errno), errno);
                         }
-#ifdef __linux__
-                        /* Kernel event is automatically deleted when closed */
-                        request.data.fd = sock_client;
-                        if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sock_client, &request) < 0) {
-                            merror("epoll when deleting connected socket: %s (%d)", strerror(errno), errno);
+
+                        // Fallthrough
+
+                    case 0:
+                        if (wnotify_delete(notify, sock_client) < 0) {
+                            merror("wnotify_delete(%d): %s (%d)", sock_client, strerror(errno), errno);
                         }
-#endif /* __linux__ */
 
                         _close_sock(&keys, sock_client);
                         continue;
-                    }
 
-                    recv_b = recv(sock_client, buffer, length, MSG_WAITALL);
-
-                    if (recv_b != (ssize_t)length) {
-                        merror("Incorrect message size from %s: expecting %u, got %zd", inet_ntoa(peer_info.sin_addr), length, recv_b);
-#ifdef __linux__
-                        request.data.fd = sock_client;
-                        if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, sock_client, &request) < 0) {
-                            merror("epoll when deleting connected socket: %s (%d)", strerror(errno), errno);
-                        }
-#endif /* __linux__ */
-                        _close_sock(&keys, sock_client);
-                    } else {
-                        rem_msgpush(buffer, recv_b, &peer_info, sock_client);
+                    default:
+                        rem_add_recv((unsigned long)recv_b);
                     }
                 }
             }
@@ -257,6 +215,7 @@ void HandleSecure()
                 continue;
             } else {
                 rem_msgpush(buffer, recv_b, &peer_info, -1);
+                rem_add_recv((unsigned long)recv_b);
             }
         }
     }
@@ -278,6 +237,20 @@ void * rem_handler_main(__attribute__((unused)) void * args) {
     return NULL;
 }
 
+// Key reloader thread
+void * rem_keyupdate_main(__attribute__((unused)) void * args) {
+    int seconds;
+
+    mdebug1("Key reloader thread started.");
+    seconds = getDefine_Int("remoted", "keyupdate_interval", 1, 3600);
+
+    while (1) {
+        mdebug2("Checking for keys file changes.");
+        check_keyupdate();
+        sleep(seconds);
+    }
+}
+
 static void HandleSecureMessage(char *buffer, int recv_b, struct sockaddr_in *peer_info, int sock_client) {
     int agentid;
     int protocol = logr.proto[logr.position];
@@ -287,6 +260,8 @@ static void HandleSecureMessage(char *buffer, int recv_b, struct sockaddr_in *pe
     char agname[KEYSIZE + 1];
     char *tmp_msg;
     size_t msg_length;
+    char ip_found = 0;
+    int r;
 
     /* Set the source IP */
     strncpy(srcip, inet_ntoa(peer_info->sin_addr), IPSIZE);
@@ -296,8 +271,6 @@ static void HandleSecureMessage(char *buffer, int recv_b, struct sockaddr_in *pe
     memset(cleartext_msg, '\0', OS_MAXSTR + 1);
     memset(srcmsg, '\0', OS_FLSIZE + 1);
     tmp_msg = NULL;
-
-    check_keyupdate();
 
     /* Get a valid agent id */
     if (buffer[0] == '!') {
@@ -325,74 +298,109 @@ static void HandleSecureMessage(char *buffer, int recv_b, struct sockaddr_in *pe
         tmp_msg++;
         recv_b -= 2;
 
+        key_lock_read();
         agentid = OS_IsAllowedDynamicID(&keys, buffer + 1, srcip);
 
         if (agentid == -1) {
             int id = OS_IsAllowedID(&keys, buffer + 1);
+
             if (id < 0) {
                 strncpy(agname, "unknown", sizeof(agname));
             } else {
                 strncpy(agname, keys.keyentries[id]->name, sizeof(agname));
             }
+
+            key_unlock();
+
             agname[sizeof(agname) - 1] = '\0';
 
-            merror(ENC_IP_ERROR, buffer + 1, srcip, agname);
+            mwarn(ENC_IP_ERROR, buffer + 1, srcip, agname);
 
+            // Send key request by id
+            push_request(buffer + 1,"id");
             if (sock_client >= 0)
                 _close_sock(&keys, sock_client);
 
             return;
         }
     } else {
+        key_lock_read();
         agentid = OS_IsAllowedIP(&keys, srcip);
 
         if (agentid < 0) {
+            key_unlock();
             mwarn(DENYIP_WARN, srcip);
 
+            // Send key request by ip
+            push_request(srcip,"ip");
             if (sock_client >= 0)
                 _close_sock(&keys, sock_client);
 
             return;
+        } else {
+            ip_found = 1;
         }
+
         tmp_msg = buffer;
     }
 
     /* Decrypt the message */
-    tmp_msg = ReadSecMSG(&keys, tmp_msg, cleartext_msg, agentid, recv_b - 1, &msg_length, srcip);
-
-    if (tmp_msg == NULL) {
-
+    if (r = ReadSecMSG(&keys, tmp_msg, cleartext_msg, agentid, recv_b - 1, &msg_length, srcip, &tmp_msg), r != KS_VALID) {
         /* If duplicated, a warning was already generated */
+        key_unlock();
+
+        if (r == KS_ENCKEY) {
+            if (ip_found) {
+                push_request(srcip,"ip");
+            } else {
+                push_request(buffer + 1, "id");
+            }
+        }
+
+        if (sock_client >= 0)
+            _close_sock(&keys, sock_client);
+
         return;
     }
 
     /* Check if it is a control message */
     if (IsValidHeader(tmp_msg)) {
-        /* We need to save the peerinfo if it is a control msg */
-        memcpy(&keys.keyentries[agentid]->peer_info, peer_info, logr.peer_size);
+        r = 2;
 
-        if (protocol == TCP_PROTO) {
-            switch (OS_AddSocket(&keys, agentid, sock_client)) {
-            case 0:
-                merror("Couldn't add TCP socket to keystore.");
-                break;
-            case 1:
-                mdebug2("TCP socket already in keystore.");
-                break;
-            default:
-                ;
-            }
+        /* We need to save the peerinfo if it is a control msg */
+
+        memcpy(&keys.keyentries[agentid]->peer_info, peer_info, logr.peer_size);
+        keyentry * key = OS_DupKeyEntry(keys.keyentries[agentid]);
+        r = (protocol == TCP_PROTO) ? OS_AddSocket(&keys, agentid, sock_client) : 2;
+        keys.keyentries[agentid]->rcvd = time(0);
+
+        switch (r) {
+        case 0:
+            merror("Couldn't add TCP socket to keystore.");
+            break;
+        case 1:
+            mdebug2("TCP socket %d already in keystore. Updating...", sock_client);
+            break;
+        default:
+            ;
         }
 
-        keys.keyentries[agentid]->rcvd = time(0);
-        save_controlmsg((unsigned)agentid, tmp_msg, msg_length - 3);
+        key_unlock();
 
+        // The critical section for readers closes within this function
+        save_controlmsg(key, tmp_msg, msg_length - 3);
+        rem_inc_ctrl_msg();
+
+        OS_FreeKey(key);
         return;
     }
 
     /* Generate srcmsg */
+
     snprintf(srcmsg, OS_FLSIZE, "[%s] (%s) %s", keys.keyentries[agentid]->id,
              keys.keyentries[agentid]->name, keys.keyentries[agentid]->ip->ip);
+
+    key_unlock();
 
     /* If we can't send the message, try to connect to the
      * socket again. If it not exit.
@@ -404,15 +412,101 @@ static void HandleSecureMessage(char *buffer, int recv_b, struct sockaddr_in *pe
         if ((logr.m_queue = StartMQ(DEFAULTQUEUE, WRITE)) < 0) {
             merror_exit(QUEUE_FATAL, DEFAULTQUEUE);
         }
+    } else {
+        rem_inc_evt();
     }
 }
 
 // Close and remove socket from keystore
 int _close_sock(keystore * keys, int sock) {
     int retval;
-    key_lock_write();
+
+    key_lock_read();
     retval = OS_DeleteSocket(keys, sock);
     key_unlock();
-    close(sock);
+
+    if (nb_close(&netbuffer, sock) == 0) {
+        rem_dec_tcp();
+    }
+
+    mdebug1("TCP peer disconnected [%d]", sock);
+
     return retval;
+}
+
+int key_request_connect() {
+#ifndef WIN32
+    return OS_ConnectUnixDomain(isChroot() ? WM_KEY_REQUEST_SOCK : WM_KEY_REQUEST_SOCK_PATH, SOCK_DGRAM, OS_MAXSTR);
+#else
+    return -1;
+#endif
+}
+
+static int send_key_request(int socket,const char *msg) {
+    return OS_SendUnix(socket,msg,strlen(msg));
+}
+
+static void _push_request(const char *request,const char *type) {
+    char *msg = NULL;
+
+    os_calloc(OS_MAXSTR,sizeof(char),msg);
+    snprintf(msg,OS_MAXSTR,"%s:%s",type,request);
+
+    if(queue_push_ex(key_request_queue, msg) < 0) {
+        os_free(msg);
+    }
+}
+
+int key_request_reconnect() {
+    int socket;
+    static int max_attempts = 4;
+    int attempts;
+
+    while (1) {
+        for (attempts = 0; attempts < max_attempts; attempts++) {
+            if (socket = key_request_connect(), socket < 0) {
+                sleep(1);
+            } else {
+                if(OS_SetSendTimeout(socket, 5) < 0){
+                    close(socket);
+                    continue;
+                }
+                key_request_available = 1;
+                return socket;
+            }
+        }
+        mdebug1("Key-polling wodle is not available. Retrying connection in %d seconds.", KEY_RECONNECT_INTERVAL);
+        sleep(KEY_RECONNECT_INTERVAL);
+    }
+}
+
+void * w_key_request_thread(__attribute__((unused)) void * args) {
+    char * msg = NULL;
+    int socket = -1;
+
+    while(1) {
+        if (socket < 0) {
+            socket = key_request_reconnect();
+        }
+
+        if (msg || (msg = queue_pop_ex(key_request_queue))) {
+            int rc;
+
+            if ((rc = send_key_request(socket, msg)) < 0) {
+                if (rc == OS_SOCKBUSY) {
+                    mdebug1("Key request socket busy.");
+                    sleep(1);
+                } else {
+                    merror("Could not communicate with key request queue (%d). Is the module running?", rc);
+                    if (socket >= 0) {
+                        key_request_available = 0;
+                        close(socket);
+                        socket = -1;
+                    }
+                }
+            } else {
+                os_free(msg);
+            }
+        }
+    }
 }

@@ -1,5 +1,5 @@
 /* Remoted queue handling library
- * Copyright (C) 2018 Wazuh Inc.
+ * Copyright (C) 2015-2019, Wazuh Inc.
  * April 2, 2018.
  *
  * This program is a free software; you can redistribute it
@@ -44,7 +44,7 @@ int rem_msgpush(const char * buffer, unsigned long size, struct sockaddr_in * ad
     if (result < 0) {
         rem_msgfree(message);
         mdebug2("Discarding event from host '%s'", inet_ntoa(addr->sin_addr));
-
+        rem_inc_discarded();
         if (!reported) {
             mwarn("Message queue is full (%zu). Events may be lost.", queue->size);
             reported = 1;
@@ -52,6 +52,26 @@ int rem_msgpush(const char * buffer, unsigned long size, struct sockaddr_in * ad
     }
 
     return result;
+}
+
+// Get current queue size
+size_t rem_get_qsize() {
+    size_t size = 0;
+    w_mutex_lock(&mutex);
+    size = (queue->begin - queue->end + queue->size) % queue->size;
+    w_mutex_unlock(&mutex);
+    return size;
+}
+
+// Get total queue size
+size_t rem_get_tsize() {
+    static size_t size = 0;
+    if (!size) {
+        w_mutex_lock(&mutex);
+        size = queue->size;
+        w_mutex_unlock(&mutex);
+    }
+    return size;
 }
 
 // Pop message from queue

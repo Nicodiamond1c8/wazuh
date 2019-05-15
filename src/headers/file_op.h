@@ -1,4 +1,5 @@
-/* Copyright (C) 2009 Trend Micro Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
  * All rights reserved.
  *
  * This program is a free software; you can redistribute it
@@ -12,11 +13,20 @@
 #ifndef __FILE_H
 #define __FILE_H
 
+#include <stdint.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <external/cJSON/cJSON.h>
 
 #define OS_PIDFILE  "/var/run"
+#define UCS2_LE 1
+#define UCS2_BE 2
+
+#ifdef WIN32
+typedef uint64_t wino_t;
+#else
+typedef ino_t wino_t;
+#endif
 
 typedef struct File {
     char *name;
@@ -36,7 +46,15 @@ off_t FileSize(const char * path);
 
 int IsDir(const char *file) __attribute__((nonnull));
 
+int check_path_type(const char *dir) __attribute__((nonnull));
+
 int IsFile(const char *file) __attribute__((nonnull));
+
+int IsSocket(const char * file) __attribute__((nonnull));
+
+#ifndef WIN32
+int IsLink(const char * file) __attribute__((nonnull));
+#endif
 
 int CreatePID(const char *name, int pid) __attribute__((nonnull));
 
@@ -48,13 +66,11 @@ void DeleteState();
 
 int MergeFiles(const char *finalpath, char **files, const char *tag) __attribute__((nonnull(1, 2)));
 
-int MergeAppendFile(const char *finalpath, const char *files, const char *tag) __attribute__((nonnull(1)));
+int MergeAppendFile(const char *finalpath, const char *files, const char *tag, int path_offset) __attribute__((nonnull(1)));
 
 int UnmergeFiles(const char *finalpath, const char *optdir, int mode) __attribute__((nonnull(1)));
 
 int TestUnmergeFiles(const char *finalpath, int mode) __attribute__((nonnull(1)));
-
-int w_backup_file(File *file, const char *source) __attribute__((nonnull(1, 2)));
 
 /* Daemonize a process */
 void goDaemon(void);
@@ -76,11 +92,16 @@ int mkstemp_ex(char *tmp_path) __attribute__((nonnull));
 
 int TempFile(File *file, const char *source, int copy);
 int OS_MoveFile(const char *src, const char *dst);
+int w_copy_file(const char *src, const char *dst,char mode,char * message,int silent);
 
 /* Checks for Windows Vista */
 #ifdef WIN32
 int checkVista();
 int isVista;
+int get_creation_date(char *dir, SYSTEMTIME *utc);
+
+// Move to the directory where this executable lives in
+void w_ch_exec_dir();
 #endif
 
 /* Delete directory recursively */
@@ -97,7 +118,32 @@ int mkdir_ex(const char * path);
 
 int w_ref_parent_folder(const char * path);
 
+wino_t get_fp_inode(FILE * fp);
+
+long get_fp_size(FILE * fp);
+
 // Read directory and return an array of contained files, sorted alphabetically.
 char ** wreaddir(const char * name);
 
+// Open file normally in Linux, allow read/write/delete in Windows
+FILE * wfopen(const char * pathname, const char * mode);
+
+/* Delete a line from a file */
+int w_remove_line_from_file(char *file, int line);
+
+// To compress an decompress a file in gzip
+int w_compress_gzfile(const char *filesrc, const char *filedst);
+int w_uncompress_gzfile(const char *gzfilesrc, const char *gzfiledst);
+int is_ascii_utf8(const char * file, unsigned int max_lines, unsigned int max_chars_utf8);
+int is_usc2(const char * file);
+
+#ifdef WIN32
+DWORD FileSizeWin(const char * file);
+#endif
+
+int checkBinaryFile(const char *f_name);
+
+#ifndef WIN32
+size_t w_fread_timeout(void *ptr, size_t size, size_t nitems, FILE *stream, int timeout);
+#endif
 #endif /* __FILE_H */

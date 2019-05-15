@@ -1,4 +1,5 @@
-/* Copyright (C) 2009 Trend Micro Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
  * All rights reserved.
  *
  * This program is a free software; you can redistribute it
@@ -50,6 +51,7 @@ int main(int argc, char **argv)
     const char *cfg = DEFAULTCPATH;
     short day_wait = -1;
     char * end;
+    int debug_level = 0;
 
     /* Initialize global variables */
     mond.a_queue = 0;
@@ -67,6 +69,7 @@ int main(int argc, char **argv)
                 break;
             case 'd':
                 nowDebug();
+                debug_level = 1;
                 break;
             case 'f':
                 run_foreground = 1;
@@ -118,6 +121,15 @@ int main(int argc, char **argv)
 
     }
 
+    if (debug_level == 0) {
+        /* Get debug level */
+        debug_level = getDefine_Int("monitord", "debug", 0, 2);
+        while (debug_level != 0) {
+            nowDebug();
+            debug_level--;
+        }
+    }
+
     /* Start daemon */
     mdebug1(STARTED_MSG);
 
@@ -137,6 +149,7 @@ int main(int argc, char **argv)
     mond.keep_log_days = getDefine_Int("monitord", "keep_log_days", 0, 500);
     mond.size_rotate = (unsigned long) getDefine_Int("monitord", "size_rotate", 0, 4096) * 1024 * 1024;
     mond.daily_rotations = getDefine_Int("monitord", "daily_rotations", 1, 256);
+    mond.delete_old_agents = (unsigned int)getDefine_Int("monitord", "delete_old_agents", 0, 9600);
 
     mond.agents = NULL;
     mond.smtpserver = NULL;
@@ -194,6 +207,34 @@ int main(int argc, char **argv)
 
         OS_ClearXML(&xml);
     }
+
+    // Do not monitor agents in client nodes
+
+    OS_XML cl_xml;
+    const char * xmlf[] = {"ossec_config", "cluster", "disabled", NULL};
+    const char * xmlf2[] = {"ossec_config", "cluster", "node_type", NULL};
+
+    if (OS_ReadXML(cfg, &cl_xml) < 0) {
+        mdebug1(XML_ERROR, cfg, cl_xml.err, cl_xml.err_line);
+    } else {
+        // Read the cluster status and the node type from the configuration file
+        char * cl_status = OS_GetOneContentforElement(&cl_xml, xmlf);
+        if (cl_status && cl_status[0] != '\0') {
+            if (!strncmp(cl_status, "no", 2)) {
+                char * cl_type = OS_GetOneContentforElement(&cl_xml, xmlf2);
+                if (cl_type && cl_type[0] != '\0') {
+                    if (!strncmp(cl_type, "client", 6) || !strncmp(cl_type, "worker", 6)) {
+                        mdebug1("Cluster client node: Disabled the agent monitoring");
+                        mond.monitor_agents = 0;
+                    }
+                    free(cl_type);
+                }
+            }
+
+            free(cl_status);
+        }
+    }
+    OS_ClearXML(&cl_xml);
 
     /* Exit here if test config is set */
     if (test_config) {

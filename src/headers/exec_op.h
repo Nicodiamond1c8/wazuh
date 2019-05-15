@@ -1,6 +1,6 @@
 /*
  * Subprocess execution library
- * Copyright (C) 2018 Wazuh Inc.
+ * Copyright (C) 2015-2019, Wazuh Inc.
  * May 1, 2018
  *
  * This program is a free software; you can redistribute it
@@ -12,13 +12,23 @@
 #ifndef EXEC_OP_H
 #define EXEC_OP_H
 
-#define W_BIND_STDOUT 1
-#define W_BIND_STDERR 2
-#define W_CHECK_WRITE 4
+#define W_BIND_STDOUT   001
+#define W_BIND_STDERR   002
+#define W_CHECK_WRITE   004
+#define W_APPEND_POOL   010
+
+#ifdef WIN32
+#define WEXITSTATUS(x) x
+#endif
 
 typedef struct wfd_t {
     FILE * file;
+#ifdef WIN32
+    PROCESS_INFORMATION pinfo;
+#else
     pid_t pid;
+#endif
+    unsigned int append_pool:1;
 } wfd_t;
 
 // Open a stream from a process without shell (execvp form)

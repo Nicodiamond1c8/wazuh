@@ -1,4 +1,5 @@
-/* Copyright (C) 2009 Trend Micro Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
  * All right reserved.
  *
  * This program is a free software; you can redistribute it
@@ -12,6 +13,8 @@
 #include "shared_download.h"
 #include <unistd.h>
 
+/* Global variables */
+int pass_empty_keyfile;
 
 /* Prototypes */
 static void help_remoted(void) __attribute__((noreturn));
@@ -127,6 +130,21 @@ int main(int argc, char **argv)
 
     logr.nocmerged = nocmerged ? 1 : !getDefine_Int("remoted", "merge_shared", 0, 1);
 
+    // Don`t create the merged file in worker nodes of the cluster
+
+    // Read the cluster status and the node type from the configuration file
+    int is_worker = w_is_worker();
+
+    switch (is_worker){
+        case 0:
+            mdebug1("This is not a worker");
+            break;
+        case 1:
+            mdebug1("Cluster worker node: Disabling the merged.mg creation");
+            logr.nocmerged = 1;
+            break;
+    }
+
     /* Exit if test_config is set */
     if (test_config) {
         exit(0);
@@ -134,11 +152,13 @@ int main(int argc, char **argv)
 
     if (logr.conn == NULL) {
         /* Not configured */
+        minfo("Remoted connection is not configured... Exiting.");
         exit(0);
     }
 
     /* Don't exit when client.keys empty (if set) */
-    if (getDefine_Int("remoted", "pass_empty_keyfile", 0, 1)) {
+    pass_empty_keyfile = getDefine_Int("remoted", "pass_empty_keyfile", 0, 1);
+    if (pass_empty_keyfile) {
         OS_PassEmptyKeyfile();
     }
 
@@ -180,7 +200,7 @@ int main(int argc, char **argv)
     os_random();
 
     /* Start up message */
-    minfo(STARTUP_MSG, (int)getpid());
+    mdebug2(STARTUP_MSG, (int)getpid());
 
     //Start shared download
     w_init_shared_download();

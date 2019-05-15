@@ -1,4 +1,5 @@
-/* Copyright (C) 2009 Trend Micro Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
  * All rights reserved.
  *
  * This program is a free software; you can redistribute it
@@ -40,6 +41,7 @@
 #include <sys/time.h>
 #include <sys/param.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 #ifndef WIN32
 #include <sys/wait.h>
@@ -78,6 +80,7 @@
 #ifndef WIN32
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -142,7 +145,7 @@ typedef int sock2len_t;
 typedef int uid_t;
 typedef int gid_t;
 typedef int socklen_t;
-#define sleep(x) Sleep(x * 1000)
+#define sleep(x) Sleep((x) * 1000)
 #define srandom(x) srand(x)
 #define lstat(x,y) stat(x,y)
 #define CloseSocket(x) closesocket(x)
@@ -173,11 +176,18 @@ extern const char *__local_name;
 
 #define os_malloc(x,y) ((y = (__typeof__(y)) malloc(x)))?(void)1:merror_exit(MEM_ERROR, errno, strerror(errno))
 
-#define os_free(x) (x)?free(x):merror("free a null")
+#define os_free(x) if(x){free(x);x=NULL;}
 
 #define os_realloc(x,y,z) ((z = (__typeof__(z))realloc(x,y)))?(void)1:merror_exit(MEM_ERROR, errno, strerror(errno))
 
 #define os_clearnl(x,p) if((p = strrchr(x, '\n')))*p = '\0';
+
+
+#define w_fclose(x) if (x) { fclose(x); x=NULL; }
+
+#define w_strdup(x,y) ({ int retstr = 0; if (x) { os_strdup(x, y);} else retstr = 1; retstr;})
+
+#define w_ftell(x)({ long z = ftell(x); if(z < 0) merror_exit("Ftell function failed due to [(%d)-(%s)]", errno, strerror(errno)); z; })
 
 #ifdef CLIENT
 #define isAgent 1
@@ -213,15 +223,24 @@ extern const char *__local_name;
 #include "randombytes.h"
 #include "labels_op.h"
 #include "time_op.h"
+#include "vector_op.h"
 #include "exec_op.h"
+#include "json_op.h"
 #include "notify_op.h"
+#include "version_op.h"
 
 #include "os_xml/os_xml.h"
 #include "os_regex/os_regex.h"
 
 #include "error_messages/error_messages.h"
 #include "error_messages/debug_messages.h"
+#include "error_messages/information_messages.h"
+#include "error_messages/warning_messages.h"
 #include "custom_output_search.h"
 #include "url.h"
+#include "yaml2json.h"
+#include "cluster_utils.h"
+#include "auth_client.h"
+#include "os_utils.h"
 
 #endif /* __SHARED_H */

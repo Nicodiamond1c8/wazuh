@@ -1,8 +1,9 @@
 <!--
   -  Open smtpd rules
   -  Author: Daniel Cid.
+  -  Updated by Wazuh, Inc.
+  -  Copyright (C) 2015-2019, Wazuh Inc.
   -  Copyright (C) 2009 Trend Micro Inc.
-  -  Updated by Wazuh, Inc. <support@wazuh.com>.
   -  This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2.
 -->
 
@@ -70,6 +71,7 @@ y Error
     <if_sid>53500</if_sid>
     <match>Server certificate verification failed</match>
     <description>Server TLS certificate verification failed.</description>
+    <group>gdpr_IV_35.7.d,</group>
   </rule>
 
 </group>

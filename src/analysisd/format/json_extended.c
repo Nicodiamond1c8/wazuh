@@ -1,4 +1,4 @@
-/* Copyright (C) 2015 Wazuh Inc
+/* Copyright (C) 2015-2019, Wazuh Inc.
  * All rights reserved.
  *
  */
@@ -12,8 +12,13 @@
 #define MAX_STRING 1024
 #define MAX_STRING_LESS 30
 
+static const char *pattern = "^[A-Z][a-z][a-z] [ 0123][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] ([^ ]+)";
+regex_t * regexCompiled;
+
 void W_ParseJSON(cJSON* root, const Eventinfo* lf)
 {
+    int i;
+
     // Parse hostname & Parse AGENTIP
     if(lf->full_log && lf->hostname) {
         W_JSON_ParseHostname(root, lf);
@@ -34,7 +39,12 @@ void W_ParseJSON(cJSON* root, const Eventinfo* lf)
     }
     // Parse labels
     if (lf->labels && lf->labels[0].key) {
-        W_JSON_ParseLabels(root, lf);
+        for (i = 0; lf->labels[i].key != NULL; i++) {
+            if (!lf->labels[i].flags.system) {
+                W_JSON_ParseLabels(root, lf);
+                break;
+            }
+        }
     }
 }
 
@@ -51,7 +61,6 @@ int W_isRootcheck(cJSON* root)
     rule = cJSON_GetObjectItem(root, "rule");
 
     if (!rule) {
-        merror("at W_JSON_ParseGroups(): No rule object found.");
         return 0;
     }
 
@@ -148,20 +157,18 @@ void W_JSON_ParseGroups(cJSON* root, const Eventinfo* lf)
 {
     cJSON* groups;
     cJSON* rule;
-    int firstPCI, firstCIS, foundCIS, foundPCI;
+    int firstPCI, firstCIS, firstGDPR, firstGPG13;
     char delim[2];
     char buffer[MAX_STRING] = "";
     char* token;
 
-    firstPCI = firstCIS = 1;
-    foundPCI = foundCIS = 0;
+    firstPCI = firstCIS = firstGDPR = firstGPG13 = 1;
     delim[0] = ',';
     delim[1] = 0;
 
     rule = cJSON_GetObjectItem(root, "rule");
 
     if (!rule) {
-        merror("at W_JSON_ParseGroups(): No rule object found.");
         return;
     }
 
@@ -170,18 +177,16 @@ void W_JSON_ParseGroups(cJSON* root, const Eventinfo* lf)
 
     token = strtok(buffer, delim);
     while(token) {
-        foundPCI = foundCIS = 0;
-        foundPCI = add_groupPCI(rule, token, firstPCI);
-        if(!foundPCI)
-            foundCIS = add_groupCIS(rule, token, firstCIS);
-
-        if(foundPCI && firstPCI)
+        if (add_groupPCI(rule, token, firstPCI)) {
             firstPCI = 0;
-        if(foundCIS && firstCIS)
+        } else if (add_groupCIS(rule, token, firstCIS)) {
             firstCIS = 0;
-
-        if(!foundPCI && !foundCIS) {
-            cJSON_AddItemToArray(groups, cJSON_CreateString(token));
+        } else if (add_groupGDPR(rule, token, firstGDPR)) {
+            firstGDPR = 0;
+        } else if (add_groupGPG13(rule, token, firstGPG13)) {
+            firstGPG13 = 0;
+        } else {
+            if (token) cJSON_AddItemToArray(groups, cJSON_CreateString(token));
         }
         token = strtok(0, delim);
     }
@@ -230,6 +235,48 @@ int add_groupCIS(cJSON* rule, char* group, int firstCIS)
     return 0;
 }
 
+// Parse groups GDPR
+int add_groupGDPR(cJSON* rule, char* group, int firstGDPR)
+{
+    cJSON* gdpr;
+    char *aux;
+    if((startsWith("gdpr_", group)) == 1) {
+        if(firstGDPR == 1) {
+            gdpr = cJSON_CreateArray();
+            cJSON_AddItemToObject(rule, "gdpr", gdpr);
+        } else {
+            gdpr = cJSON_GetObjectItem(rule, "gdpr");
+        }
+        aux = strdup(group);
+        str_cut(aux, 0, 5);
+        cJSON_AddItemToArray(gdpr, cJSON_CreateString(aux));
+        free(aux);
+        return 1;
+    }
+    return 0;
+}
+
+// Parse groups GPG13
+int add_groupGPG13(cJSON* rule, char* group, int firstGPG13)
+{
+    cJSON* gpg13;
+    char *aux;
+    if((startsWith("gpg13_", group)) == 1) {
+        if(firstGPG13 == 1) {
+            gpg13 = cJSON_CreateArray();
+            cJSON_AddItemToObject(rule, "gpg13", gpg13);
+        } else {
+            gpg13 = cJSON_GetObjectItem(rule, "gpg13");
+        }
+        aux = strdup(group);
+        str_cut(aux, 0, 6);
+        cJSON_AddItemToArray(gpg13, cJSON_CreateString(aux));
+        free(aux);
+        return 1;
+    }
+    return 0;
+}
+
 // If hostname being with "(" means that alerts came from an agent, so we will remove the brakets
 // ** TODO ** Regex instead str_cut
 void W_JSON_ParseHostname(cJSON* root,const Eventinfo* lf)
@@ -238,50 +285,39 @@ void W_JSON_ParseHostname(cJSON* root,const Eventinfo* lf)
     cJSON* manager;
     cJSON* predecoder;
     cJSON * name;
+    char * agent_hostname = NULL;
+    regmatch_t match[2];
+    int match_size;
+
     agent = cJSON_GetObjectItem(root, "agent");
     manager = cJSON_GetObjectItem(root, "manager");
 
-    if(lf->hostname[0] == '(') {
-        char* search;
-        char* agent_hostname = NULL;
-        char string[MAX_STRING] = "";
-        int index;
-        regex_t regexCompiled;
-        regmatch_t match[2];
-        int match_size;
+    // If location starts with '(' the event comes from an agent
 
-        strncpy(string, lf->hostname, MAX_STRING - 1);
-        search = strchr(string, ')');
-
-        if(search) {
-            index = (int)(search - string);
-            str_cut(string, index, -1);
-            str_cut(string, 0, 1);
-            cJSON_AddStringToObject(agent, "name", string);
+    if(lf->location[0] == '(') {
+        cJSON_AddStringToObject(agent, "name", lf->hostname);
+    } else {
+        if(lf->agent_id && !strcmp(lf->agent_id, "000")){
+            if (name = cJSON_GetObjectItem(manager,"name"), name) {
+                cJSON_AddItemReferenceToObject(agent, "name", name);
+            }
         }
+    }
 
-        // Get agent hostname
-        static const char *pattern = "^[A-Z][a-z][a-z] [ 0123][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] ([^ ]+)";
-        if (regcomp(&regexCompiled, pattern, REG_EXTENDED)) {
+    // Get predecoder hostname
+
+    if (!regexCompiled) {
+        os_malloc(sizeof(regex_t), regexCompiled);
+
+        if (regcomp(regexCompiled, pattern, REG_EXTENDED)) {
             merror_exit("Can not compile regular expression.");
         }
-        if(regexec(&regexCompiled, lf->full_log, 2, match, 0) == 0){
-            match_size = match[1].rm_eo - match[1].rm_so;
-            agent_hostname = malloc(match_size + 1);
-            snprintf (agent_hostname, match_size + 1, "%.*s", match_size, lf->full_log + match[1].rm_so);
+    }
 
-            if (!cJSON_HasObjectItem(root, "predecoder")) {
-                cJSON_AddItemToObject(root, "predecoder", predecoder = cJSON_CreateObject());
-            } else {
-                predecoder = cJSON_GetObjectItem(root, "predecoder");
-            }
-
-            cJSON_AddStringToObject(predecoder, "hostname", agent_hostname);
-            free(agent_hostname);
-        }
-        regfree(&regexCompiled);
-
-    } else {
+    if(regexec(regexCompiled, lf->full_log, 2, match, 0) == 0){
+        match_size = match[1].rm_eo - match[1].rm_so;
+        agent_hostname = malloc(match_size + 1);
+        snprintf (agent_hostname, match_size + 1, "%.*s", match_size, lf->full_log + match[1].rm_so);
 
         if (!cJSON_HasObjectItem(root, "predecoder")) {
             cJSON_AddItemToObject(root, "predecoder", predecoder = cJSON_CreateObject());
@@ -289,21 +325,14 @@ void W_JSON_ParseHostname(cJSON* root,const Eventinfo* lf)
             predecoder = cJSON_GetObjectItem(root, "predecoder");
         }
 
-        if(lf->agent_id && !strcmp(lf->agent_id, "000")){
-            if (name = cJSON_GetObjectItem(manager,"name"), name) {
-                cJSON_AddItemReferenceToObject(agent, "name", name);
-            }
-
-            cJSON_AddStringToObject(predecoder, "hostname", lf->hostname);
-        }else{
-            cJSON_AddStringToObject(predecoder, "hostname", lf->hostname);
-        }
+        cJSON_AddStringToObject(predecoder, "hostname", agent_hostname);
+        free(agent_hostname);
     }
 }
 // Parse timestamp
 void W_JSON_AddTimestamp(cJSON* root, const Eventinfo* lf)
 {
-    char timestamp[64];
+    char timestamp[160];
     char datetime[64];
     char timezone[64];
     struct tm tm;
@@ -321,26 +350,32 @@ void W_JSON_AddTimestamp(cJSON* root, const Eventinfo* lf)
 // ** TODO ** Regex instead str_cut
 void W_JSON_ParseAgentIP(cJSON* root, const Eventinfo* lf)
 {
-    char *string;
+    char *string = NULL;
     char *ip;
     char *end;
     cJSON* agent;
 
-    if (lf->hostname[0] == '(') {
-        string = strdup(lf->hostname);
+    ip = labels_get(lf->labels, "_agent_ip");
 
-        if ((ip = strchr(string, ')'))) {
-            if ((end = strchr(ip += 2, '-')))
-                *end = '\0';
+    if (!ip) {
 
-            if (strcmp(ip, "any")){
-                agent = cJSON_GetObjectItem(root, "agent");
-                cJSON_AddStringToObject(agent, "ip", ip);
+        if (lf->location[0] == '(') {
+            string = strdup(lf->location);
+
+            if ((ip = strchr(string, ')'))) {
+                if ((end = strchr(ip += 2, '-')))
+                    *end = '\0';
             }
         }
-
-        free(string);
     }
+
+    if (ip && strcmp(ip, "any")){
+        agent = cJSON_GetObjectItem(root, "agent");
+        cJSON_AddStringToObject(agent, "ip", ip);
+    }
+
+    os_free(string);
+
 }
 
 // The file location usually comes with more information about the alert (like hostname or ip) we will extract just the
@@ -518,7 +553,7 @@ void W_JSON_ParseLabels(cJSON *root, const Eventinfo *lf) {
     cJSON_AddItemToObject(agent, "labels", labels);
 
     for (i = 0; lf->labels[i].key != NULL; i++) {
-        if (!lf->labels[i].flags.hidden || Config.show_hidden_labels) {
+        if (!lf->labels[i].flags.system && (!lf->labels[i].flags.hidden || Config.show_hidden_labels)) {
             W_JSON_AddField(labels, lf->labels[i].key, lf->labels[i].value);
         }
     }

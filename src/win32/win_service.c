@@ -1,4 +1,5 @@
-/* Copyright (C) 2009 Trend Micro Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
  * All rights reserved.
  *
  * This program is a free software; you can redistribute it
@@ -25,7 +26,7 @@ static SERVICE_STATUS          ossecServiceStatus;
 static SERVICE_STATUS_HANDLE   ossecServiceStatusHandle;
 
 void WINAPI OssecServiceStart (DWORD argc, LPTSTR *argv);
-
+void wm_kill_children();
 
 /* Start OSSEC-HIDS service */
 int os_start_service()
@@ -249,6 +250,11 @@ VOID WINAPI OssecServiceCtrlHandler(DWORD dwOpcode)
                 minfo("Received exit signal.");
                 SetServiceStatus (ossecServiceStatusHandle, &ossecServiceStatus);
                 minfo("Exiting...");
+
+#ifdef OSSECHIDS
+                // Kill children processes spawned by modules, only in wazuh-agent
+                wm_kill_children();
+#endif
                 return;
             default:
                 break;

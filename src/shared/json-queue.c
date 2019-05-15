@@ -1,4 +1,4 @@
-/* Copyright (C) 2017 Wazuh Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
  * All right reserved.
  *
  * This program is a free software; you can redistribute it
@@ -61,6 +61,8 @@ cJSON * jqueue_next(file_queue * queue) {
     if (!queue->fp && jqueue_open(queue, 1) < 0) {
         return NULL;
     }
+
+    clearerr(queue->fp);
 
     if (fgets(buffer, OS_MAXSTR + 1, queue->fp)) {
         if (end = strchr(buffer, '\n'), end) {

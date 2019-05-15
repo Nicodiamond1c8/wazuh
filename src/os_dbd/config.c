@@ -1,4 +1,5 @@
-/* Copyright (C) 2009 Trend Micro Inc.
+/* Copyright (C) 2015-2019, Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
  * All rights reserved.
  *
  * This program is a free software; you can redistribute it
@@ -39,6 +40,7 @@ int OS_ReadDBConf(__attribute__((unused)) int test_config, const char *cfgfile, 
 
     /* Read configuration */
     if (ReadConfig(modules, cfgfile, tmp_config, db_config) < 0) {
+        free(tmp_config);
         return (OS_INVALID);
     }
 
@@ -109,4 +111,3 @@ int OS_ReadDBConf(__attribute__((unused)) int test_config, const char *cfgfile, 
 
     return (1);
 }
-
